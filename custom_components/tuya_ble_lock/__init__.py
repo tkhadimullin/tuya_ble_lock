@@ -9,8 +9,9 @@ from __future__ import annotations
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.components import bluetooth
+from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
 from homeassistant.const import Platform
 from homeassistant.helpers import device_registry as dr
 
@@ -183,6 +184,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         session = TuyaBLELockSession(
             hass, ble_device, login_key, virtual_id, device_uuid,
             protocol_version=protocol_version,
+        )
+
+        # Register bluetooth callback to keep BLE device reference fresh
+        # This is critical for ESPHome BLE proxy support — the callback fires
+        # whenever any adapter (local or proxy) sees an advertisement from this
+        # device, updating the BLEDevice with the correct source/proxy routing.
+        @callback
+        def _async_update_ble(
+            service_info: bluetooth.BluetoothServiceInfoBleak,
+            change: bluetooth.BluetoothChange,
+            _session=session,
+        ) -> None:
+            _session.set_ble_device(service_info.device)
+
+        entry.async_on_unload(
+            bluetooth.async_register_callback(
+                hass,
+                _async_update_ble,
+                BluetoothCallbackMatcher({ADDRESS: mac}),
+                bluetooth.BluetoothScanningMode.ACTIVE,
+            )
         )
 
         coordinator = TuyaBLELockCoordinator(

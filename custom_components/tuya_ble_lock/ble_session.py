@@ -14,7 +14,7 @@ import time
 from typing import Callable
 
 from bleak import BleakClient
-from bleak_retry_connector import establish_connection
+from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
 
@@ -66,7 +66,7 @@ class TuyaBLELockSession:
         self._device_uuid = device_uuid
         self._auth_key = auth_key
         self._protocol_version = protocol_version
-        self._client: BleakClient | None = None
+        self._client: BleakClientWithServiceCache | None = None
         self._seq = ble_protocol.SequenceCounter()
         self._keys: dict[int, bytes] = {}
         if login_key:
@@ -81,6 +81,10 @@ class TuyaBLELockSession:
         self._dp_report_callback: Callable[[list[dict]], None] | None = None
         self._write_uuid: str = WRITE_UUID
         self._notify_uuid: str = NOTIFY_UUID
+
+    def set_ble_device(self, ble_device) -> None:
+        """Update BLE device reference (called from bluetooth advertisement callback)."""
+        self._ble_device = ble_device
 
     def _resolve_gatt_uuids(self) -> tuple[str | None, str | None]:
         """Find write and notify characteristic UUIDs from discovered services.
@@ -301,12 +305,7 @@ class TuyaBLELockSession:
         for attempt in range(max_attempts):
             try:
                 await self.async_disconnect()
-                # Refresh BLE device object — stale scan data can cause silent failures
-                fresh = bluetooth.async_ble_device_from_address(
-                    self._hass, self._ble_device.address, connectable=True
-                )
-                if fresh:
-                    self._ble_device = fresh
+                # BLE device is kept fresh by bluetooth callback in __init__.py
                 # Log which BLE adapter/source will be used
                 _details = getattr(self._ble_device, 'details', None) or {}
                 _source = _details.get('source') if isinstance(_details, dict) else getattr(_details, 'source', None)
@@ -314,11 +313,13 @@ class TuyaBLELockSession:
                               attempt + 1, max_attempts, self._ble_device.address,
                               _source, getattr(self._ble_device, 'rssi', '?'))
                 self._client = await establish_connection(
-                    client_class=BleakClient,
+                    client_class=BleakClientWithServiceCache,
                     device=self._ble_device,
                     name="tuya_ble_lock",
                     disconnected_callback=self._on_disconnect,
                     max_attempts=2,
+                    use_services_cache=True,
+                    ble_device_callback=lambda: self._ble_device,
                 )
                 # Log discovered services on first successful connection
                 if self._client.services:
@@ -346,7 +347,19 @@ class TuyaBLELockSession:
                     pass
                 self._notif_buf.clear()
                 _LOGGER.debug("Starting notify on %s for %s", notify_uuid, self._ble_device.address)
-                await self._client.start_notify(notify_uuid, self._on_notify)
+                try:
+                    await self._client.start_notify(notify_uuid, self._on_notify)
+                except Exception as notify_exc:
+                    if "Notify acquired" in str(notify_exc):
+                        # BlueZ kept stale subscription — disconnect fully and retry
+                        _LOGGER.debug("Stale notify subscription, disconnecting to clear: %s", notify_exc)
+                        try:
+                            await self._client.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise
                 self.is_connected = True
 
                 # Some devices (e.g. H8 Pro with service 1910) auto-push
@@ -354,7 +367,7 @@ class TuyaBLELockSession:
                 # Wait for auto-push, then try explicit DEVICE_INFO if nothing arrived.
                 # Note: some devices send PAIR/TIME BEFORE DEVICE_INFO, so we
                 # wait the full timeout and try to parse what we have.
-                deadline_auto = time.monotonic() + 3.5
+                deadline_auto = time.monotonic() + 5.0
                 got_data = False
                 while time.monotonic() < deadline_auto:
                     await asyncio.sleep(0.2)
@@ -375,7 +388,7 @@ class TuyaBLELockSession:
                     # No auto-push: send DEVICE_INFO explicitly (FD50 devices)
                     _LOGGER.debug("No auto-push, sending device info (sec_flag=4)")
                     await self._send_encrypted(CMD_DEVICE_INFO, mtu_data, SEC_LOGIN_KEY)
-                    deadline_di = time.monotonic() + 4.0
+                    deadline_di = time.monotonic() + 6.0
                     while time.monotonic() < deadline_di:
                         await asyncio.sleep(0.2)
                         if self._notif_buf:
@@ -591,11 +604,13 @@ class TuyaBLELockSession:
             try:
                 await self.async_disconnect()
                 self._client = await establish_connection(
-                    client_class=BleakClient,
+                    client_class=BleakClientWithServiceCache,
                     device=self._ble_device,
                     name="tuya_ble_lock",
                     disconnected_callback=self._on_disconnect,
                     max_attempts=2,
+                    use_services_cache=True,
+                    ble_device_callback=lambda: self._ble_device,
                 )
                 # Log discovered services
                 if self._client.services:
